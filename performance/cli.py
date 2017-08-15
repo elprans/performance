@@ -99,11 +99,17 @@ def parse_args():
     cmd.add_argument('config_file',
                      help='Configuration filename')
     cmd.add_argument('revision',
-                     help='Python benchmarked revision')
-    cmd.add_argument('branch', nargs='?',
-                     help='Git branch')
+                     help='Python benchmarked revision',
+                     nargs='?')
+    cmd.add_argument('--build-setup',
+                     help='Build setup defined in configuration file',
+                     default='default')
     cmd.add_argument('--patch',
                      help='Patch file')
+    cmd.add_argument('--setup-local',
+                     help='Setup.local file')
+    cmd.add_argument('--reuse-build', action="store_true",
+                     help="Reuse previous build for this configuration.")
     cmd.add_argument('-U', '--no-update', action="store_true",
                      help="Don't update the Git repository")
     cmd.add_argument('-T', '--no-tune', action="store_true",
@@ -119,6 +125,9 @@ def parse_args():
              'of CONFIG_FILE')
     cmd.add_argument('config_file',
                      help='Configuration filename')
+    cmd.add_argument('--build-setup',
+                     help='Build setup defined in configuration file',
+                     default='default')
     cmds.append(cmd)
 
     # upload

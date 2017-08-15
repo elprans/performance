@@ -1,9 +1,11 @@
 import configparser
 import datetime
 import errno
+import fileinput
 import json
 import logging
 import math
+import os
 import os.path
 import perf
 import re
@@ -25,7 +27,7 @@ from performance.venv import (GET_PIP_URL, REQ_OLD_PIP, PERFORMANCE_ROOT,
 
 GIT = True
 DEFAULT_BRANCH = 'master' if GIT else 'default'
-LOG_FORMAT = '%(asctime)-15s: %(message)s'
+LOG_FORMAT = '%(message)s'
 
 EXIT_ALREADY_EXIST = 10
 EXIT_COMPILE_ERROR = 11
@@ -59,16 +61,19 @@ class Task(object):
     def run_nocheck(self, *cmd, **kw):
         return self.app.run_nocheck(*cmd, cwd=self.cwd, **kw)
 
-    def run(self, *cmd, **kw):
-        self.app.run(*cmd, cwd=self.cwd, **kw)
+    def run(self, *cmd, cwd=None, **kw):
+        if cwd is None:
+            cwd = self.cwd
+        self.app.run(*cmd, cwd=cwd, **kw)
 
 
 class Repository(Task):
-    def __init__(self, app, path):
+    def __init__(self, app, path, work_tree):
         super().__init__(app, path)
         self.logger = app.logger
         self.app = app
         self.conf = app.conf
+        self.work_tree = os.path.abspath(os.path.realpath(work_tree))
 
     def fetch(self):
         if GIT:
@@ -78,32 +83,92 @@ class Repository(Task):
 
     def parse_revision(self, revision):
         branch_rev = '%s/%s' % (self.conf.git_remote, revision)
+        sha = None
 
-        exitcode, stdout = self.get_output_nocheck('git', 'rev-parse',
-                                                   '--verify', branch_rev)
+        exitcode, stdout = self.get_output_nocheck(
+            'git', 'show-ref', '-d', branch_rev)
         if not exitcode:
-            return (True, branch_rev, stdout)
+            sha = stdout.strip().split(' ')[0]
+        else:
+            exitcode, stdout = self.get_output_nocheck(
+                'git', 'show-ref', '-d', revision)
+            if not exitcode:
+                sha = stdout.strip().split(' ')[0]
+            else:
+                exitcode, stdout = self.get_output_nocheck(
+                    'git', 'rev-parse', '--verify', revision)
+                if not exitcode and stdout.startswith(revision):
+                    sha = stdout
 
-        exitcode, stdout = self.get_output_nocheck('git', 'rev-parse',
-                                                   '--verify', revision)
-        if not exitcode and stdout.startswith(revision):
-            revision = stdout
-            return (False, revision, revision)
+        if sha is None:
+            self.logger.error("ERROR: unable to parse revision %r" % (revision,))
+            sys.exit(1)
 
-        self.logger.error("ERROR: unable to parse revision %r" % (revision,))
-        sys.exit(1)
+        stdout = self.get_output(
+            'git', 'branch', '--all', '--no-column', '--no-color',
+            '--contains', sha)
+
+        branches = []
+
+        for line in stdout.split('\n'):
+            line = line.strip()
+            if not line.startswith(self.conf.git_remote):
+                continue
+            branch = line[len(self.conf.git_remote) + 1:]
+            m = re.match(r'(\d+)\.(\d)+', branch)
+            if m:
+                branches.append((int(m.group(1)), int(m.group(2))))
+
+        branches.sort()
+
+        branch = branches[0]
+
+        return branch, revision, sha
 
     def checkout(self, revision):
         if GIT:
-            # remove all untracked files
-            self.run('git', 'clean', '-fdx')
+            if self.work_tree:
+                if os.path.exists(self.work_tree):
+                    output = self.get_output(
+                        'git', 'worktree', 'list', '--porcelain')
+                    for line in output.split('\n'):
+                        if line.startswith('worktree '):
+                            path = line[len('worktree '):]
+                            if path == self.work_tree:
+                                break
+                    else:
+                        self.logger.error(
+                            '{} exists and is not a git work tree'.format(
+                                self.work_tree))
+                        sys.exit(1)
 
-            # checkout to requested revision
-            self.run('git', 'reset', '--hard', 'HEAD')
-            self.run('git', 'checkout', revision)
+                    self.app.safe_rmdir(self.work_tree)
 
-            # remove all untracked files
-            self.run('git', 'clean', '-fdx')
+                self.run('git', 'worktree', 'add', '--detach',
+                         self.work_tree, revision)
+
+                asdl_c = os.path.join(self.work_tree, 'Parser', 'asdl_c.py')
+                with open(asdl_c, 'r+') as f:
+                    stat = os.fstat(f.fileno())
+
+                    content = re.sub(r'#!\s*/usr/bin/env\s+python',
+                                     '#! /usr/bin/env python2', f.read())
+                    f.seek(0)
+                    f.write(content)
+
+                # Restore the mtime to avoid unnecessary ADSL compile.
+                os.utime(asdl_c, (stat.st_atime, stat.st_mtime))
+
+            else:
+                # remove all untracked files
+                self.run('git', 'clean', '-fdx')
+
+                # checkout to requested revision
+                self.run('git', 'reset', '--hard', 'HEAD')
+                self.run('git', 'checkout', revision)
+
+                # remove all untracked files
+                self.run('git', 'clean', '-fdx')
         else:
             self.run('hg', 'up', '--clean', '-r', revision)
             # FIXME: run hg purge?
@@ -243,7 +308,9 @@ class Python(Task):
         self.branch = app.branch
         self.conf = conf
         self.logger = app.logger
-        self.program = None
+        self.program = os.path.join(self.conf.prefix, "bin", "python")
+        if not os.path.exists(self.program):
+            self.program = os.path.join(self.conf.prefix, "bin", "python3")
         self.hexversion = None
 
     def patch(self, filename):
@@ -251,18 +318,21 @@ class Python(Task):
             return
 
         self.logger.error('Apply patch %s in %s (revision %s)'
-                          % (filename, self.conf.repo_dir, self.app.revision))
+                          % (filename, self.conf.work_tree, self.app.revision))
         self.app.run('patch', '-p1',
-                     cwd=self.conf.repo_dir,
+                     cwd=self.conf.work_tree,
                      stdin_filename=filename)
 
     def compile(self):
         build_dir = self.conf.build_dir
+        src_dir = self.conf.work_tree
 
         self.app.safe_rmdir(build_dir)
         self.app.safe_makedirs(build_dir)
 
         config_args = []
+        env = {}
+        extra_cflags = []
         if self.branch.startswith("2.") and not MS_WINDOWS:
             # On Python 2, use UCS-4 for Unicode on all platforms, except
             # on Windows which uses UTF-16 because of its 16-bit wchar_t
@@ -272,17 +342,85 @@ class Python(Task):
         if self.conf.debug:
             config_args.append('--with-pydebug')
         elif self.conf.lto:
-            config_args.append('--with-lto')
+            extra_cflags.extend([
+                '-g', '-flto', '-fuse-linker-plugin', '-ffat-lto-objects'
+            ])
         if self.conf.debug:
             config_args.append('CFLAGS=-O0')
-        configure = os.path.join(self.conf.repo_dir, 'configure')
-        self.run(configure, *config_args)
+        if self.conf.cflags:
+            config_args.append('CFLAGS={}'.format(self.conf.cflags))
+        if self.conf.opt:
+            config_args.append('OPT={}'.format(self.conf.opt))
+        if self.conf.ldflags:
+            config_args.append('LDFLAGS={}'.format(self.conf.ldflags))
+        if self.conf.cc:
+            config_args.append('CC={}'.format(self.conf.cc))
+        if self.conf.ar:
+            config_args.append('AR={}'.format(self.conf.ar))
+        if self.conf.ranlib:
+            config_args.append('RANLIB={}'.format(self.conf.ranlib))
+        if self.conf.computed_gotos:
+            config_args.append('--with-computed-gotos')
+        else:
+            config_args.append('--without-computed-gotos')
+        if self.conf.configure:
+            config_args.extend(shlex.split(self.conf.configure))
+        if self.conf.path:
+            path = os.environ.get('PATH')
+            if path:
+                path = self.conf.path + os.pathsep + path
+            else:
+                path = self.conf_path
+            env['PATH'] = path
+        configure = os.path.join(self.conf.work_tree, 'configure')
+        self.run(configure, *config_args, env=env)
 
+        if self.app.setup_local:
+            shutil.copy2(
+                self.app.setup_local,
+                os.path.join(build_dir, 'Modules', 'Setup.local')
+            )
+
+            self.run(
+                os.path.join(src_dir, 'Modules', 'makesetup'),
+                '-c', os.path.join(src_dir, 'Modules', 'config.c.in'),
+                '-s', 'Modules',
+                os.path.join(build_dir, 'Modules', 'Setup.config'),
+                os.path.join(build_dir, 'Modules', 'Setup.local'),
+                os.path.join(build_dir, 'Modules', 'Setup'),
+                cwd=build_dir)
+
+            os.rename(os.path.join(build_dir, 'config.c'),
+                      os.path.join(build_dir, 'Modules', 'config.c'))
+
+            if self.conf.no__math:
+                Makefile = os.path.join(build_dir, 'Makefile')
+                stat = os.stat(Makefile)
+
+                with fileinput.input(Makefile, inplace=True) as f:
+                    for line in f:
+                        if not re.match(r'^Modules/_math\.o:.*PY_CORE_CFLAGS.*$',
+                                        line):
+                            print(line, end='')
+
+                os.utime(Makefile, (stat.st_atime, stat.st_mtime))
+
+        extra_cflags = ' '.join(extra_cflags)
+        extra_make_opts = []
+        if self.conf.profile_task:
+            extra_make_opts.append(
+                'PROFILE_TASK={}'.format(self.conf.profile_task))
+
+        jobs = 1 # os.cpu_count()
         if self.conf.pgo:
             # FIXME: use taskset (isolated CPUs) for PGO?
-            self.run('make', 'profile-opt')
+            self.run('make', '-j{}'.format(jobs), 
+                     'EXTRA_CFLAGS={}'.format(extra_cflags), 'profile-opt', 
+                     *extra_make_opts, env=env)
         else:
-            self.run('make')
+            self.run('make', '-j{}'.format(jobs),
+                     'EXTRA_CFLAGS={}'.format(extra_cflags),
+                     *extra_make_opts, env=env) 
 
     def install_python(self):
         if sys.platform in ('darwin', 'win32'):
@@ -353,6 +491,12 @@ class Python(Task):
         # Dump the pip version
         self.run(self.program, '-u', '-m', 'pip', '--version')
 
+    def install_virtualenv(self):
+        if self.hexversion < 0x3030000:
+            cmd = [self.program, '-u', '-m', 'pip', 'install',
+                   '-U', 'virtualenv']
+            self.run(*cmd)
+
     def install_performance(self):
         cmd = [self.program, '-u', '-m', 'pip', 'install']
 
@@ -370,60 +514,58 @@ class Python(Task):
         self.install_python()
         self.get_version()
         self.install_pip()
+        self.install_virtualenv()
         self.install_performance()
 
 
 class BenchmarkRevision(Application):
-    def __init__(self, conf, revision, branch=None, patch=None,
-                 setup_log=True, filename=None, commit_date=None):
+    def __init__(self, config_filename, revision=None, patch=None,
+                 setup_log=True, filename=None, commit_date=None,
+                 build_setup='default', no_tune=None, no_update=None,
+                 reuse_build=False, setup_local=None):
+        config_filename = os.path.abspath(config_filename)
+        conf = parse_config(config_filename, "compile", build_setup)
+        if no_tune:
+            conf.system_tune = False
+        if no_update:
+            conf.update = False
         super().__init__(conf)
         self.patch = patch
+        self.setup_local = setup_local
+        self.build_setup = build_setup
         self.exitcode = 0
         self.uploaded = False
+        self.reuse_build = reuse_build
+
+        if revision is None:
+            revision = conf.revision
 
         if setup_log:
-            if branch:
-                prefix = 'compile-%s-%s' % (branch, revision)
-            else:
-                prefix = 'compile-%s' % revision
+            prefix = 'compile-%s' % revision
             self.setup_log(prefix)
 
         if filename is None:
-            self.repository = Repository(self, conf.repo_dir)
-            self.init_revision(revision, branch)
+            self.repository = Repository(self, conf.repo_dir, conf.work_tree)
+            self.init_revision(revision)
         else:
             # path used by cmd_upload()
             self.repository = None
+            self.branch = None
             self.filename = filename
             self.revision = revision
-            self.branch = branch
             self.commit_date = commit_date
-            self.logger.error("Commit: branch=%s, revision=%s"
-                              % (self.branch, self.revision))
+            self.logger.error("Commit: %s" % (self.revision))
 
         self.upload_filename = os.path.join(self.conf.uploaded_json_dir,
                                             os.path.basename(self.filename))
 
-    def init_revision(self, revision, branch=None):
+    def init_revision(self, revision):
         if self.conf.update:
             self.repository.fetch()
 
+        branch, rev_name, full_revision = self.repository.parse_revision(revision)
         if branch:
-            is_branch, rev_name, full_revision = self.repository.parse_revision(branch)
-            if not is_branch:
-                self.logger.error("ERROR: %r is not a Git branch" % self.branch)
-                sys.exit(1)
-            self.branch = branch
-        else:
-            self.branch = None
-
-        is_branch, rev_name, full_revision = self.repository.parse_revision(revision)
-        if is_branch:
-            if self.branch and revision != self.branch:
-                raise ValueError("inconsistenct branches: "
-                                 "revision=%r, branch=%r"
-                                 % (revision, branch))
-            self.branch = revision
+            self.branch = '{}.{}'.format(*branch)
         elif not self.branch:
             self.branch = DEFAULT_BRANCH
 
@@ -439,6 +581,8 @@ class BenchmarkRevision(Application):
             patch = os.path.basename(self.patch)
             patch = os.path.splitext(patch)[0]
             filename = "%s-patch-%s" % (filename, patch)
+        if self.build_setup:
+            filename += "-%s" % (self.build_setup,)
         filename = filename + ".json.gz"
         if self.patch:
             self.filename = os.path.join(self.conf.json_patch_dir, filename)
@@ -631,12 +775,13 @@ class BenchmarkRevision(Application):
     def compile_bench(self):
         self.python = Python(self, self.conf)
 
-        try:
-            self.compile_install()
-        except SystemExit:
-            sys.exit(EXIT_COMPILE_ERROR)
+        if not self.reuse_build:
+            try:
+                self.compile_install()
+            except SystemExit:
+                sys.exit(EXIT_COMPILE_ERROR)
 
-        self.create_venv()
+            self.create_venv()
 
         failed = self.run_benchmark()
         if not failed and self.conf.upload:
@@ -671,7 +816,7 @@ class Configuration:
     pass
 
 
-def parse_config(filename, command):
+def parse_config(filename, command, build_setup):
     parse_compile = False
     parse_compile_all = False
     if command == 'compile_all':
@@ -686,12 +831,12 @@ def parse_config(filename, command):
     cfgobj = configparser.ConfigParser()
     cfgobj.read(filename)
 
-    def getstr(section, key, default=None):
+    def getstr(section, key, default=Exception):
         try:
             sectionobj = cfgobj[section]
             value = sectionobj[key]
         except KeyError:
-            if default is None:
+            if default is Exception:
                 raise
             return default
 
@@ -700,12 +845,15 @@ def parse_config(filename, command):
         # strip spaces
         return value.strip()
 
-    def getboolean(section, key, default):
-        try:
-            sectionobj = cfgobj[section]
-            return sectionobj.getboolean(key, default)
-        except KeyError:
-            return default
+    def getboolean(section, key, default=Exception):
+        if default is Exception:
+            try:
+                return cfgobj.getboolean(section, key)
+            except (configparser.NoOptionError,
+                    configparser.NoSectionError) as e:
+                raise KeyError(e.args[0]) from e
+        else:
+            return cfgobj.getboolean(section, key, fallback=default)
 
     # [config]
     conf.json_dir = os.path.expanduser(getstr('config', 'json_dir'))
@@ -721,9 +869,105 @@ def parse_config(filename, command):
 
         # [compile]
         conf.directory = os.path.expanduser(getstr('compile', 'bench_dir'))
+        conf.path = getstr('compile', 'path', '/usr/bin')
         conf.lto = getboolean('compile', 'lto', True)
         conf.pgo = getboolean('compile', 'pgo', True)
+        conf.cflags = getstr('compile', 'cflags', None)
+        conf.opt = getstr('compile', 'opt', None)
+        conf.cc = getstr('compile', 'cc', None)
+        conf.ar = getstr('compile', 'ar', None)
+        conf.ranlib = getstr('compile', 'ranlib', None)
+        conf.computed_gotos = getboolean('compile', 'gotos', True)
+        conf.ldflags = getstr('compile', 'ldflags', None)
         conf.install = getboolean('compile', 'install', True)
+        conf.revision = getstr('compile', 'revision', None)
+        conf.configure = getstr('compile', 'configure', None)
+        conf.profile_task = getstr('compile', 'profile_task', None)
+        conf.no__math  = getboolean('compile', 'no__math', False)
+        if build_setup:
+            compile_section = 'compile:{}'.format(build_setup)
+            try:
+                conf.directory = os.path.expanduser(
+                    getstr(compile_section, 'bench_dir'))
+            except KeyError:
+                pass
+
+            conf.directory = conf.directory.format(env=build_setup)
+
+            try:
+                conf.lto = getboolean(compile_section, 'lto')
+            except KeyError:
+                pass
+
+            try:
+                conf.pgo = getboolean(compile_section, 'pgo')
+            except KeyError:
+                pass
+
+            try:
+                conf.cflags = getstr(compile_section, 'cflags')
+            except KeyError:
+                pass
+
+            try:
+                conf.opt = getstr(compile_section, 'opt')
+            except KeyError:
+                pass
+
+            try:
+                conf.cc = getstr(compile_section, 'cc')
+            except KeyError:
+                pass
+
+            try:
+                conf.ar = getstr(compile_section, 'ar')
+            except KeyError:
+                pass
+
+            try:
+                conf.ranlib = getstr(compile_section, 'ranlib')
+            except KeyError:
+                pass
+
+            try:
+                conf.computed_gotos = getboolean(compile_section, 'gotos')
+            except KeyError:
+                pass
+
+            try:
+                conf.ldflags = getstr(compile_section, 'ldflags')
+            except KeyError:
+                pass
+
+            try:
+                conf.install = getboolean(compile_section, 'install')
+            except KeyError:
+                pass
+
+            try:
+                conf.path = getstr(compile_section, 'path')
+            except KeyError:
+                pass
+
+            try:
+                conf.revision = getstr(compile_section, 'revision')
+            except KeyError:
+                pass
+
+            try:
+                conf.configure = getstr(compile_section, 'configure')
+            except KeyError:
+                pass
+
+            try:
+                conf.profile_task = getstr(compile_section, 'profile_task')
+            except KeyError:
+                pass
+
+            try:
+                conf.no__math = getboolean(compile_section, 'no__math')
+            except KeyError:
+                pass
 
         # [run_benchmark]
         conf.system_tune = getboolean('run_benchmark', 'system_tune', True)
@@ -735,6 +979,7 @@ def parse_config(filename, command):
         conf.build_dir = os.path.join(conf.directory, 'build')
         conf.prefix = os.path.join(conf.directory, 'prefix')
         conf.venv = os.path.join(conf.directory, 'venv')
+        conf.work_tree = os.path.join(conf.directory, 'source')
 
         check_upload = conf.upload
     else:
@@ -785,9 +1030,9 @@ def parse_config(filename, command):
 
 
 class BenchmarkAll(Application):
-    def __init__(self, config_filename):
+    def __init__(self, config_filename, build_setup='default'):
         config_filename = os.path.abspath(config_filename)
-        conf = parse_config(config_filename, "compile_all")
+        conf = parse_config(config_filename, "compile_all", build_setup)
         super().__init__(conf)
         self.config_filename = config_filename
         self.safe_makedirs(self.conf.directory)
@@ -904,14 +1149,13 @@ class BenchmarkAll(Application):
 
 
 def cmd_compile(options):
-    conf = parse_config(options.config_file, "compile")
-    if options is not None:
-        if options.no_update:
-            conf.update = False
-        if options.no_tune:
-            conf.system_tune = False
-    bench = BenchmarkRevision(conf, options.revision, options.branch,
-                              patch=options.patch)
+    bench = BenchmarkRevision(options.config_file, options.revision,
+                              patch=options.patch,
+                              build_setup=options.build_setup,
+                              no_tune=options.no_tune,
+                              no_update=options.no_update,
+                              reuse_build=options.reuse_build,
+                              setup_local=options.setup_local)
     bench.main()
 
 
@@ -932,5 +1176,5 @@ def cmd_upload(options):
 
 
 def cmd_compile_all(options):
-    bench = BenchmarkAll(options.config_file)
+    bench = BenchmarkAll(options.config_file, build_setup=options.build_setup)
     bench.main()
